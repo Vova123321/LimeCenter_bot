@@ -1,23 +1,12 @@
 const TelegramApi = require('node-telegram-bot-api');
 
-const mysql = require('mysql2/promise');
+const { pool, token_id } = require('./config.js');
 
 const Excel = require('exceljs');
 
-const token = 'token';
-
-const bot = new TelegramApi(token, { polling: true });
+const bot = new TelegramApi(token_id, { polling: true });
 
 
-
-const pool = mysql.createPool({
-    host: 'test',
-    user: 'test',
-    database: 'test',
-    password: 'test',
-    port: 3306,
-    connectionLimit: 10 // Максимальное количество соединений в пуле
-});
 
 async function connectToDatabase() {
     try {
@@ -45,10 +34,85 @@ connectToDatabase()
         console.error('Ошибка при подключении к базе данных:', error);
     });
 
+async function getAllTelegramIds() {
+    try {
+        // Получаем соединение из пула
+        const connection = await pool.getConnection();
+        console.log('Подключение к базе данных успешно установлено!');
+
+        // Выполняем запрос к базе данных для получения всех уникальных Telegram ID
+        const query = 'SELECT DISTINCT telegram_id FROM orders_notification';
+        const [rows, fields] = await connection.execute(query);
+
+        // Освобождаем соединение обратно в пул
+        connection.release();
+
+        return rows.map(row => row.telegram_id);
+    } catch (error) {
+        console.error('Ошибка при выполнении запроса:', error);
+        throw error;
+    }
+}
+
 const userContext = {};
 
+const admin_id = 781115975;
+async function getDataForLastHour() {
+    try {
+        // Получаем текущее время минус один час
+        const oneHourAgo = new Date();
+        oneHourAgo.setHours(oneHourAgo.getHours() - 1);
+
+        // Получаем соединение из пула
+        const connection = await pool.getConnection();
+        console.log('Подключение к базе данных успешно установлено!');
+
+        // Выполняем запрос к базе данных для получения записей за последний час
+        const query = 'SELECT * FROM orders WHERE Registered_on >= ?';
+        const [rows, fields] = await connection.execute(query, [oneHourAgo]);
+
+        // Освобождаем соединение обратно в пул
+        connection.release();
+
+        return rows;
+    } catch (error) {
+        console.error('Ошибка при выполнении запроса:', error);
+        throw error;
+    }
+}
+
+async function sendRecordsToAllUsers() {
+    try {
+        // Получаем все Telegram ID из базы данных
+        const allTelegramIds = await getAllTelegramIds();
+
+        // Получаем данные за последний час
+        const rows = await getDataForLastHour();
+
+        // Отправляем сообщение каждому Telegram ID
+        for (const telegramId of allTelegramIds) {
+            // Формируем сообщение для отправки каждому пользователю
+            let message = `За последний час появилось ${rows.length} новых записей:\n`;
+            for (const row of rows) {
+                message += `ID: ${row.id}\nФамилия: ${row.Surname}\nИмя: ${row.Name}\nОтчество: ${row.Patronymc}\nТелефон: ${row.Phone}\nНужно ли позвонить: ${row.PhoneCall}\nE-mail: ${row.Email}\nВремя регистрации на сайте: ${row.Registered_on}\nПодтверждение: ${row.Confirmed}\nГород: ${row.city}\nОпыт: ${row.experience}\nТип работы: ${row.work_type}\nВозраст: ${row.age}\nВозможности: ${row.equipment}\n\n`;
+            }
+
+            // Отправляем сообщение пользователю
+            await bot.sendMessage(telegramId, message);
+        }
+
+    } catch (error) {
+        console.error('Ошибка при отправке данных:', error);
+    }
+}
+
+// Вызываем функцию каждый час
+setInterval(() => {
+    sendRecordsToAllUsers();
+}, 3600000); // 3600000 миллисекунд = 1 час
 
 
+// Вызываем функцию каждый час
 async function getDataFromDateRange(startDate, endDate) {
     try {
         // Создаем пул соединений
@@ -137,6 +201,7 @@ async function admin_panel(msg) {
                 ["Изменить название чатов"],
                 ["Изменить ссылку на видео"],
                 ["Изменить скрипт"],
+                ["Управление уведомлениями"],
                 ["Выйти с Админ-панели"],
 
             ],
@@ -227,6 +292,16 @@ const commandHandlers = {
                 resize_keyboard: true
             }
         });
+    },
+    "Управление уведомлениями": async (msg) => {
+      await bot.sendMessage(msg.chat.id, 'Вы в настройках уведомлений', {
+          reply_markup: {
+              inline_keyboard: [
+                  [{ text: `Добавить пользователя`, callback_data: 'notification_allow' }],
+                  [{ text: `Удалить пользователя`, callback_data: 'notification_not_allow' }],
+              ]
+          }
+      });
     },
     "Изменить скрипт": async (msg) => {
         try {
@@ -1328,7 +1403,6 @@ bot.on('callback_query', async (callbackQuery) => {
             userContext[chatId].awaitingResponse = false;
         }
     }
-
     else if (data === 'change_title2') {
         const chatId = callbackQuery.message.chat.id;
         if (!userContext[chatId]) {
@@ -1394,8 +1468,6 @@ bot.on('callback_query', async (callbackQuery) => {
             userContext[chatId].awaitingResponse = false;
         }
     }
-
-
     else if (data === 'change_title3') {
         const chatId = callbackQuery.message.chat.id;
         if (!userContext[chatId]) {
@@ -1431,6 +1503,139 @@ bot.on('callback_query', async (callbackQuery) => {
 
                         // Отправляем сообщение об успешном обновлении названия
                         await bot.sendMessage(chatId, 'Название было изменено: ' + enteredNewTitle);
+
+                    } catch (error) {
+                        console.error('Ошибка выполнения запроса: ' + error.stack);
+                        await bot.sendMessage(chatId, 'Произошла ошибка при выполнении запроса к базе данных.');
+                    } finally {
+                        // Возвращаем администратора в админское меню
+                        await admin_panel(msg);
+                        // Возвращаем соединение в пул
+                        connection.release();
+                        console.log('Закрытие соединения с базой данных');
+                        // Удаляем обработчик сообщений
+                        bot.off('message', messageHandler);
+
+                        // await connection.execute('UPDATE admin_status SET status = 0 WHERE id = 1')
+                        // console.log('админ-статус = 0');
+
+                        userContext[chatId].awaitingResponse = false;
+                    }
+                }
+            };
+
+            // Подписываемся на обработку входящих сообщений
+            bot.on('message', messageHandler);
+            userContext[chatId].awaitingResponse = false;
+        } catch (error) {
+            console.log(error);
+        }
+        finally {
+            userContext[chatId].awaitingResponse = false;
+        }
+    }
+    else if (data === 'notification_allow') {
+        const chatId = callbackQuery.message.chat.id;
+        if (!userContext[chatId]) {
+            userContext[chatId] = { awaitingResponse: true };
+        } else {
+            userContext[chatId].awaitingResponse = true;
+        }
+
+        try {
+
+
+            // Получаем соединение из пула
+            const connection = await pool.getConnection();
+            console.log('Подключение к базе данных успешно установлено!');
+
+            // Отправляем сообщение пользователю с запросом на ввод нового названия
+            await bot.sendMessage(chatId, 'Введите новый ID: ');
+
+            // await connection.execute('UPDATE admin_status SET status = 1 WHERE id = 1')
+            //
+            // console.log('админ-статус = 1')
+
+            // Функция для обработки входящего сообщения
+            const messageHandler = async (msg) => {
+                console.log('Зашли в messageHandler');
+                userContext[chatId].awaitingResponse = true;
+                if (msg.chat.id === chatId && userContext[chatId].awaitingResponse) {
+                    const enteredNewTitle = msg.text;
+
+                    try {
+                        // Выполнение запроса к базе данных для обновления названия
+                        await connection.execute('INSERT INTO orders_notification (telegram_id) VALUES (?)', [enteredNewTitle]);
+
+
+                        // Отправляем сообщение об успешном обновлении названия
+                        await bot.sendMessage(chatId, 'Новый айди был добавлен: ' + enteredNewTitle);
+
+                    } catch (error) {
+                        console.error('Ошибка выполнения запроса: ' + error.stack);
+                        await bot.sendMessage(chatId, 'Произошла ошибка при выполнении запроса к базе данных.');
+                    } finally {
+                        // Возвращаем администратора в админское меню
+                        await admin_panel(msg);
+                        // Возвращаем соединение в пул
+                        connection.release();
+                        console.log('Закрытие соединения с базой данных');
+                        // Удаляем обработчик сообщений
+                        bot.off('message', messageHandler);
+
+                        // await connection.execute('UPDATE admin_status SET status = 0 WHERE id = 1')
+                        // console.log('админ-статус = 0');
+
+                        userContext[chatId].awaitingResponse = false;
+                    }
+                }
+            };
+
+            // Подписываемся на обработку входящих сообщений
+            bot.on('message', messageHandler);
+            userContext[chatId].awaitingResponse = false;
+        } catch (error) {
+            console.log(error);
+        }
+        finally {
+            userContext[chatId].awaitingResponse = false;
+        }
+    }
+    else if (data === 'notification_not_allow') {
+        const chatId = callbackQuery.message.chat.id;
+        if (!userContext[chatId]) {
+            userContext[chatId] = { awaitingResponse: true };
+        } else {
+            userContext[chatId].awaitingResponse = true;
+        }
+
+        try {
+
+
+            // Получаем соединение из пула
+            const connection = await pool.getConnection();
+            console.log('Подключение к базе данных успешно установлено!');
+
+            // Отправляем сообщение пользователю с запросом на ввод нового названия
+            await bot.sendMessage(chatId, 'Введите ID для удаления: ');
+
+            // await connection.execute('UPDATE admin_status SET status = 1 WHERE id = 1')
+            //
+            // console.log('админ-статус = 1')
+
+            // Функция для обработки входящего сообщения
+            const messageHandler = async (msg) => {
+                console.log('Зашли в messageHandler');
+                userContext[chatId].awaitingResponse = true;
+                if (msg.chat.id === chatId && userContext[chatId].awaitingResponse) {
+                    const enteredNewTitle = msg.text;
+
+                    try {
+                        // Выполнение запроса к базе данных для обновления названия
+                        await connection.execute('DELETE FROM orders_notification WHERE telegram_id = ?', [enteredNewTitle]);
+
+                        // Отправляем сообщение об успешном обновлении названия
+                        await bot.sendMessage(chatId, 'Айди был удалён: ' + enteredNewTitle);
 
                     } catch (error) {
                         console.error('Ошибка выполнения запроса: ' + error.stack);
